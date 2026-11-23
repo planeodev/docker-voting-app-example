@@ -1,0 +1,113 @@
+# Ohanalabs GitHub-Platform CI onboarding (devsecops-docker, docker-multiarch-cicd.yaml).
+# ONE FILE PER SERVICE — not a matrix: every call of the reusable produces jobs with the same
+# names, so matrix legs (or several calls in one workflow) collide. Siblings:
+# .github/workflows/docker-multiarch-cicd-{vote,result,worker,seed}.yaml, one per buildable
+# docker-compose.yml service. redis and db (postgres) are STOCK upstream images: never built here.
+#
+# Builds the `vote` service of docker-compose.yml (context ./vote) and publishes:
+#   PR      → ghcr.io/planeodev/docker-voting-app-example/vote/pr/<N>:<sha>, :<sha7>, :head-<head-sha>
+#   main    → ghcr.io/planeodev/docker-voting-app-example/vote:main-<sha7> and :<sha>
+#   tag v*  → ghcr.io/planeodev/docker-voting-app-example/vote:<tag> (+ :latest on semver)
+# every one digest-pinned in the reusable's outputs (image_ref = <base>@sha256:…).
+#
+# This repo is a DEMO TARGET the analyzers scan: its findings (unpinned bases, EOL runtimes, old
+# deps) are kept on purpose — never fixed here. So both scans are report-only (severity NONE).
+#
+# docker-compose-context MUST equal the service's `build.context`: the reusable overrides the bake
+# target's context with it (default "." looks for ./Dockerfile at the repo root).
+#
+# vote: docker-compose.yml builds `target: dev` (no app code, `python app.py` with a file watcher,
+# for the bind-mounted local dev loop). The image to publish is the Dockerfile's `final` stage
+# (gunicorn, the code copied in), so `docker-build-target: final` overrides it — the compose file
+# itself stays as upstream wrote it. TEMPORARY: the reusable is pinned to the github-platform branch
+# that adds `docker-build-target`; switch to @main once that PR merges.
+#
+# The upstream dockersamples workflows (call-docker-build-*.yaml) are left untouched; they push to
+# dockersamples' own registries and need its Docker Hub secrets, so on this fork they fail when
+# they trigger (a change under vote/, result/ or worker/).
+name: 🐳 vote
+run-name: 🐳 vote image (vote/) for ${{ github.event_name == 'pull_request' && format('PR {0}', github.event.pull_request.number) || github.ref_name }} @ ${{ github.sha }}
+
+# Build ONLY when this service changes: its directory, the compose file or this file. Path filters
+# are not evaluated for tag pushes, so a `v*` release still builds every service.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+    paths:
+      - "vote/**"
+      - "docker-compose.yml"
+      - ".github/workflows/docker-multiarch-cicd-vote.yaml"
+  push:
+    branches:
+      - main
+    paths:
+      - "vote/**"
+      - "docker-compose.yml"
+      - ".github/workflows/docker-multiarch-cicd-vote.yaml"
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+# products/devsecops-docker/README.md "Caller concurrency": a merged PR's `closed` run (pr-delete)
+# must never cancel the main push build.
+concurrency:
+  group: docker-vote-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.event.action != 'closed' }}
+
+jobs:
+  docker:
+    name: 🐳 vote
+    uses: ohanalabs-ai/github-platform/.github/workflows/docker-multiarch-cicd.yaml@feat/docker-build-target
+    permissions:
+      contents: write           # releases on tags
+      packages: write           # push to ghcr.io; pr-delete removes the PR preview package
+      id-token: write           # OIDC for attestations + build identity
+      attestations: write       # build provenance (public repo → GitHub attestations)
+      artifact-metadata: write  # SBOM / image info — omit it and the run fails with zero jobs
+      pull-requests: write      # preview-image comment on the PR
+    with:
+      registry: ghcr.io
+      platforms: linux/amd64,linux/arm64
+      docker-compose-file-name: docker-compose.yml   # at the repo root; .yml, not the default .yaml
+      docker-compose-target-service: vote
+      docker-compose-context: ./vote
+      image-name-suffix: vote
+      docker-build-target: final                   # compose builds `dev`; publish the Dockerfile's final stage
+      github-job-timeout-minutes: 30               # multi-arch (QEMU arm64) exceeds the 10-minute default
+
+  # PR image scan, report-only (the demo's findings are kept on purpose). Thin caller.
+  scan:
+    name: 🛡️ vote scan
+    needs: docker
+    if: github.event_name == 'pull_request'
+    uses: ohanalabs-ai/github-platform/.github/workflows/docker-image-security.yaml@main
+    permissions:
+      contents: read
+      packages: read
+      attestations: read
+      pull-requests: write
+    with:
+      image: ${{ needs.docker.outputs.image_ref }}
+      severity-threshold: NONE
+
+  # 🔏 Planeo deploy stamp (owner rule 2026-10-13: scan + attestation on every repository): scans
+  # (report-only) and attests the digest with the planeodev Vault Transit key that Planeo admission
+  # trusts. Push / dispatch builds only; the merge's push build is stamped, never a PR.
+  scan-attest:
+    name: 🔏 vote deploy stamp
+    needs: docker
+    if: github.event_name != 'pull_request'
+    uses: ohanalabs-ai/github-platform/.github/workflows/docker-scan-attest.yaml@main
+    permissions:
+      contents: read
+      packages: write           # push the signature / attestations next to the image
+      id-token: write           # GitHub OIDC → Tailscale federated identity + Vault (no secret)
+      attestations: read        # classify the build's public GitHub attestation in the summary
+      pull-requests: write      # required by the nested scan reusable
+    with:
+      image: ${{ needs.docker.outputs.image_ref }}
+      build-identity: ${{ needs.docker.outputs.build_identity }}
+      builder-id: ${{ needs.docker.outputs.builder_id }}
+      severity-threshold: NONE
+      tailscale-oauth-client-id: ${{ vars.TS_FEDERATED_CLIENT_ID }}
+      tailscale-audience: ${{ vars.TS_FEDERATED_AUDIENCE }}
